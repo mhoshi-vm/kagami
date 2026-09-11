@@ -7,7 +7,6 @@ Kagami is a mirror server of Maven repositories.
 
 **Build Commands:**
 
-Backend (Spring Boot):
 ```bash
 ./mvnw clean spring-javaformat:apply compile                    # Compile application
 ./mvnw spring-javaformat:apply test                             # Run all tests
@@ -15,92 +14,28 @@ Backend (Spring Boot):
 ./mvnw spring-boot:build-image                                  # Create Docker image
 ```
 
-Frontend (React):
-```bash
-cd ui && npm install                                            # Install dependencies
-cd ui && npm run dev                                            # Start development server (port 5173)
-```
-
 **Docker:**
 - Pre-built image: `ghcr.io/making/kagami:jvm`
-- Local build: `./mvnw spring-boot:build-image`
-- Environment variable configuration supported
 
-## System Architecture
+## Architecture Constraints
 
-### Core Components
-
-1. **Storage Layer** (`am.ik.kagami.storage`)
-   - `StorageService` interface: `store()`, `retrieve()`, `delete()`, `list()`, `stat()`, `stats()`
-   - `ArtifactLocation` validates paths (rejects `..`, `~`, absolute paths); an empty path is the repository root
-   - `StorageEntry` / `StorageStats` records describe listed objects and repository statistics
-   - `LocalStorageService` implementation using filesystem, stored at `kagami.storage.path/{repositoryId}/`
-   - The only path to stored artifacts; no other package touches the filesystem
-   - `StorageServiceContractTest` is the abstract contract every backend test must extend
-
-2. **Repository Management** (`am.ik.kagami.repository`)
-   - `RemoteRepositoryService` uses Maven Resolver API for standard artifacts
-   - Each fetch resolves into a scratch local repository (temp directory) and streams the result into `StorageService`
-   - Falls back to `RestClient` for non-standard files (e.g., maven-metadata.xml)
-   - Supports Basic authentication and HTTP proxy configuration
-
-3. **Web Layer** 
-   - `ArtifactController` (`am.ik.kagami.artifact.web`) handles artifact GET and DELETE operations
-   - `BrowserController` (`am.ik.kagami.browser.web`) provides repository browsing REST API
-   - `LoginController` (`am.ik.kagami.browser.web`) serves login page via Mustache template
-   - `TokenController` (`am.ik.kagami.token.web`) generates JWT tokens (requires authentication)
-   - URL pattern: `/artifacts/{repositoryId}/**` for artifact downloads
-   - API endpoints: `/repositories/**` for repository browsing (requires authentication)
-   - Returns proper content types based on file extensions
-
-4. **Browser Feature** (`am.ik.kagami.browser`)
-   - `BrowserService` provides repository exploration and statistics on top of `StorageService`
-   - Repository listing with artifact count, size, and last update timestamps
-   - `lastModified` of a directory entry is optional (object storage has no directory timestamp)
-   - Directory navigation with breadcrumb support
-   - File information with checksums and content types
-   - Uses `@JsonInclude(NON_NULL)` to exclude null values from JSON responses
-
-5. **Security Layer** (`am.ik.kagami.config.SecurityConfig`, `am.ik.kagami.token`)
-   - Form-based authentication or OIDC/OAuth2 login for web UI access
-   - JWT token-based authentication for private repository access
-   - `BasicToBearerTokenResolver` resolves the password part of Basic auth as a JWT bearer token (username is ignored)
-   - TOKEN generation requires USER role (JWT tokens cannot generate new tokens)
-   - CSRF partially disabled for `/artifacts/**` and `/token`, Remember-me enabled for form-based auth
-   - Form-based auth: Default user configurable via `spring.security.user.*` properties
-   - OIDC auth: Supports multiple identity providers with email-based access control
-
-6. **Frontend UI** (`ui/`)
-   - React 18 + TypeScript + Vite for modern development experience
-   - Tailwind CSS for utility-first styling with component-based architecture
-   - SWR for data fetching and caching
-   - React Router v6 for client-side routing
-   - Lucide React for consistent iconography
-   - Modern, stylish design with hover effects and transitions
-   - 401 error handling with login redirection links
-   - Token generation page with repository/scope selection
-
-### Configuration
-
-- Properties use Map structure for repositories: `kagami.repositories.{id}.url`
-- Supports username/password for Basic auth per repository
-- HTTP proxy configurable via `kagami.proxy.*` properties or environment variables (`http_proxy`, `https_proxy`, `no_proxy`, also in upper case)
-- Frontend development server proxies `/repositories`, `/artifacts`, `/login` requests to backend at `http://localhost:8080`
-- Web UI authentication modes:
-  - Simple: `spring.security.user.name/password` (default: demo/demo)
-  - OIDC: OAuth2 client configuration with `kagami.authentication.allowed-name-patterns` for access control
-- JWT keys: `kagami.jwt.private-key/public-key` for token signing/verification
-- Authentication type: `kagami.authentication.type` (SIMPLE or OIDC)
-
-## Design Requirements
-
-- **Package**: `am.ik.kagami` - Main package
+- `StorageService` (`am.ik.kagami.storage`) is the single path to stored artifacts; no other
+  package touches the filesystem, so a new backend touches no other package.
+- `ArtifactLocation` rejects `..`, `~` and absolute paths; an empty path is the repository root.
+- No `Path` / `File` in the `StorageService` interface; `delete` removes everything at or under
+  a location.
+- `lastModified` of a directory entry is optional: object storage has no directory timestamp.
+- `BasicToBearerTokenResolver` resolves the password part of Basic auth as a JWT bearer token;
+  the username is ignored.
+- Token generation requires the USER role - JWT tokens cannot generate new tokens.
+- CSRF is partially disabled (`/artifacts/**`, `/token`) to support REST API usage.
+- Maven Resolver resolves into a scratch local repository (temp directory) per fetch, removed
+  afterwards. The resolved file is copied into `StorageService`; resolver bookkeeping files never
+  reach the storage. A scratch directory per fetch means no shared local-repository locking
+  between requests.
+- Non-standard files (like maven-metadata.xml) are fetched via `RestClient`, not Maven Resolver.
 
 ## Development Requirements
-
-### Prerequisites
-
-- Java 21+
 
 ### Code Standards
 
@@ -127,48 +62,10 @@ cd ui && npm run dev                                            # Start developm
 
 ### Package Structure
 
+Main package is `am.ik.kagami`.
+
 Package structure should follow the "package by feature" principle, grouping related classes
 together. Not by technical layers.
-
-Current package structure:
-- `am.ik.kagami` (Backend - Spring Boot)
-    - `artifact.web` - Artifact handling web layer
-        - `ArtifactController` - REST endpoints for artifact operations
-    - `browser` - Repository browsing feature
-        - `BrowserService` - Repository exploration and statistics
-        - `web.BrowserController` - REST API for repository browsing
-    - `proxy` - HTTP proxy settings for outgoing connections
-        - `ProxySettings` - Proxy resolution from properties and environment variables
-        - `ProxyConfig` - Applies the proxy to the auto-configured HTTP clients
-    - `repository` - Remote repository management
-        - `RemoteRepositoryService` - Maven Resolver integration
-    - `storage` - Storage abstraction layer
-        - `StorageService` - Interface (store/retrieve/delete/list/stat/stats)
-        - `ArtifactLocation` - Validated repository id + relative path
-        - `StorageEntry`, `StorageStats` - Listing and statistics records
-        - `LocalStorageService` - Filesystem implementation
-    - `config` - Configuration classes (e.g., security, cross-cutting concerns)
-        - `SecurityConfig` - Spring Security configuration with form login
-    - `token` - JWT token generation and verification
-        - `TokenSigner` - JWT signing service
-        - `web.TokenController` - Token generation endpoint
-        - `web.BasicToBearerTokenResolver` - Resolves Basic auth password as a bearer token
-- `ui/` (Frontend - React)
-    - `src/components/` - Reusable UI components
-        - `ui/` - Basic UI primitives (Button, Card, Alert, etc.)
-        - `RepositorySelector` - Repository selection interface
-        - `DirectoryBrowser` - File and folder navigation
-        - `Breadcrumb` - Navigation breadcrumb
-        - `FileInfoModal` - File details modal
-    - `src/hooks/` - Custom React hooks for API integration
-    - `src/pages/` - Top-level page components
-        - `HomePage` - Repository browser main page
-        - `TokenPage` - JWT token generation page
-    - `src/types/` - TypeScript type definitions
-    - `src/utils/` - Utility functions (formatting, styling)
-- `src/main/resources/`
-    - `templates/login.mustache` - Server-side rendered login page
-    - `static/login.css` - Login page styling to match UI design
 
 For DTOs, use inner record classes in the appropriate classes. For example, if you have a
 `UserController`, define the request/response class inside that controller class.
@@ -178,21 +75,13 @@ domain objects should be clean and not contain external layers like web or datab
 
 ### Testing Strategy
 
-Backend:
-- **Unit Tests**: JUnit 5 with AssertJ for service layer testing
-- **Integration Tests**: `@SpringBootTest` + Testcontainers for full application context
-- **Contract Tests**: `StorageServiceContractTest` is run against every `StorageService` backend
-- **E2E Tests**: `BrowserE2ETestBase` drives the built UI with Playwright (Chromium); each backend has a subclass
-- **Test Data Management**: Use `@TempDir` for filesystem testing, maintain test independence
-- **Test Stability**: All tests must pass consistently; use specific MockMvc expectations
+- **Contract Tests**: `StorageServiceContractTest` is the abstract contract every `StorageService`
+  backend test must extend
+- **E2E Tests**: `BrowserE2ETestBase` drives the built UI with Playwright (Chromium); each backend
+  has a subclass
+- Use `@TempDir` for filesystem testing, maintain test independence
+- All tests must pass consistently; use specific MockMvc expectations
 - All tests must pass before completing tasks
-- Test coverage includes artifact operations, repository browsing, and API endpoints
-
-Frontend:
-- Component-based development with TypeScript for compile-time error detection
-- SWR provides built-in error handling and loading states
-- Manual testing through development server with backend integration
-- Production builds validated through Vite's build process
 
 ### After Task completion
 
@@ -203,51 +92,6 @@ Frontend:
 ```
 osascript -e 'display notification "<Message Body>" with title "<Message Title>"'
 ```
-
-## Important Architecture Decisions
-
-1. **Maven Resolver Integration**
-   - Maven Resolver resolves into a scratch local repository (temp directory) per fetch, removed afterwards
-   - The resolved file is copied into `StorageService`; resolver bookkeeping files never reach the storage
-   - A scratch directory per fetch means no shared local-repository locking between requests
-   - Non-standard files (like maven-metadata.xml) are fetched via RestClient
-
-2. **Storage Abstraction**
-   - `StorageService` is the single path to stored artifacts, so a new backend touches no other package
-   - No `Path` / `File` in the interface; `delete` removes everything at or under a location
-   - Resource-based retrieval allows flexible implementation
-
-3. **Configuration Design**
-   - Map-based repository configuration for better organization
-   - Per-repository authentication support
-   - Flexible proxy configuration (properties + environment variables)
-
-4. **Browser API Design**
-   - REST API follows standard conventions
-   - JSON responses exclude null values using `@JsonInclude(NON_NULL)`
-   - Directory navigation uses breadcrumb pattern with `parentPath`
-   - File information includes size, timestamps, and checksums
-   - Comprehensive API documentation provided for frontend implementation
-   - All UI endpoints require authentication except `/login`, `/*.css`, `/error`, `/actuator/**`
-
-5. **Security Architecture**
-   - Form-based authentication or OIDC/OAuth2 for web UI with session management
-   - JWT tokens for programmatic access to private repositories
-   - Tokens include username (subject claim) for audit trails
-   - Basic auth automatically converted to JWT bearer tokens
-   - Token generation requires USER role - JWT tokens cannot generate new tokens
-   - CSRF protection partially disabled (`/artifacts/**`, `/token`) to support REST API usage
-   - Remember-me functionality for form-based authentication
-   - OIDC authentication supports multiple identity providers with email-based access control patterns
-
-6. **Frontend Architecture**
-   - Component-based architecture with reusable UI primitives
-   - TypeScript for type safety and better developer experience
-   - SWR for efficient data fetching, caching, and synchronization
-   - Tailwind CSS utility classes organized into maintainable components
-   - Modern design with gradient accents, subtle shadows, and smooth transitions
-   - Responsive design supporting desktop and mobile interfaces
-   - 401 error handling with user-friendly login redirection
 
 ## important-instruction-reminders
 

@@ -18,7 +18,7 @@ export interface RepositoryEntry {
   type: 'file' | 'directory';
   path: string;
   size?: number; // Only present for files
-  lastModified: string;
+  lastModified?: string; // Absent for directories on backends without directory timestamps
 }
 
 export interface BrowseResult {

@@ -1,19 +1,26 @@
 package am.ik.kagami.browser;
 
 import am.ik.kagami.KagamiProperties;
+import am.ik.kagami.storage.ArtifactLocation;
+import am.ik.kagami.storage.StorageEntry;
+import am.ik.kagami.storage.StorageService;
+import am.ik.kagami.storage.StorageStats;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Objects;
 import java.util.Map;
-import java.util.stream.Stream;
+import java.util.Objects;
+import java.util.Optional;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StreamUtils;
 import org.springframework.util.StringUtils;
 
 /**
@@ -22,13 +29,15 @@ import org.springframework.util.StringUtils;
 @Service
 public class BrowserService {
 
-	private final Path basePath;
+	private static final Logger logger = LoggerFactory.getLogger(BrowserService.class);
+
+	private final StorageService storageService;
 
 	private final KagamiProperties properties;
 
-	public BrowserService(KagamiProperties properties) {
+	public BrowserService(StorageService storageService, KagamiProperties properties) {
+		this.storageService = storageService;
 		this.properties = properties;
-		this.basePath = Path.of(properties.storage().path()).toAbsolutePath().normalize();
 	}
 
 	/**
@@ -37,43 +46,26 @@ public class BrowserService {
 	 */
 	public List<RepositoryInfo> getRepositories() {
 		List<RepositoryInfo> repositories = new ArrayList<>();
-
-		if (properties.repositories() != null) {
-			for (Map.Entry<String, KagamiProperties.Repository> entry : properties.repositories().entrySet()) {
-				String repoId = entry.getKey();
-				KagamiProperties.Repository repository = entry.getValue();
-				String url = repository.url();
-				boolean isPrivate = repository.isPrivate();
-
-				// Calculate repository statistics
-				Path repoPath = basePath.resolve(repoId);
-				long artifactCount = 0;
-				long totalSize = 0;
-				Instant lastUpdated = null;
-
-				if (Files.exists(repoPath)) {
-					try {
-						RepositoryStats stats = calculateRepositoryStats(repoPath);
-						artifactCount = stats.artifactCount();
-						totalSize = stats.totalSize();
-						lastUpdated = stats.lastUpdated();
-					}
-					catch (IOException e) {
-						// Log error but continue with zero values
-					}
-				}
-
-				repositories.add(RepositoryInfo.builder()
-					.id(repoId)
-					.url(url)
-					.artifactCount(artifactCount)
-					.totalSize(totalSize)
-					.lastUpdated(lastUpdated)
-					.isPrivate(isPrivate)
-					.build());
+		for (Map.Entry<String, KagamiProperties.Repository> entry : this.properties.repositories().entrySet()) {
+			String repoId = entry.getKey();
+			KagamiProperties.Repository repository = entry.getValue();
+			StorageStats stats;
+			try {
+				stats = this.storageService.stats(repoId);
 			}
+			catch (IOException e) {
+				logger.warn("Failed to calculate statistics of repository {}", repoId, e);
+				stats = StorageStats.EMPTY;
+			}
+			repositories.add(RepositoryInfo.builder()
+				.id(repoId)
+				.url(repository.url())
+				.artifactCount(stats.artifactCount())
+				.totalSize(stats.totalSize())
+				.lastUpdated(stats.lastUpdated())
+				.isPrivate(repository.isPrivate())
+				.build());
 		}
-
 		return repositories;
 	}
 
@@ -84,53 +76,15 @@ public class BrowserService {
 	 * @return browse result with entries
 	 */
 	public BrowseResult browseRepository(String repositoryId, @Nullable String path) throws IOException {
-		// Validate repository exists
-		if (!properties.repositories().containsKey(repositoryId)) {
-			throw new IllegalArgumentException("Repository not found: " + repositoryId);
-		}
-
-		// Normalize and validate path
-		String normalizedPath = normalizePath(path);
-		Path targetPath = basePath.resolve(repositoryId);
-		if (StringUtils.hasText(normalizedPath)) {
-			targetPath = targetPath.resolve(normalizedPath);
-		}
-
-		// Ensure path is within repository boundaries
-		targetPath = targetPath.normalize();
-		Path repoRoot = basePath.resolve(repositoryId).normalize();
-		if (!targetPath.startsWith(repoRoot)) {
-			throw new IllegalArgumentException("Invalid path: " + path);
-		}
-
-		// Check if path exists
-		if (!Files.exists(targetPath)) {
-			return BrowseResult.builder()
-				.repositoryId(repositoryId)
-				.currentPath(normalizedPath)
-				.parentPath(getParentPath(normalizedPath))
-				.entries(List.of())
-				.build();
-		}
-
-		// List directory contents
-		List<RepositoryEntry> entries = new ArrayList<>();
-		try (Stream<Path> stream = Files.list(targetPath)) {
-			stream.sorted(Comparator.comparing(Path::getFileName)).forEach(entryPath -> {
-				try {
-					RepositoryEntry entry = createRepositoryEntry(repoRoot, entryPath);
-					entries.add(entry);
-				}
-				catch (IOException e) {
-					// Skip entries that can't be read
-				}
-			});
-		}
-
+		ArtifactLocation location = toLocation(repositoryId, path);
+		List<RepositoryEntry> entries = this.storageService.list(location)
+			.stream()
+			.map(BrowserService::toRepositoryEntry)
+			.toList();
 		return BrowseResult.builder()
 			.repositoryId(repositoryId)
-			.currentPath(normalizedPath)
-			.parentPath(getParentPath(normalizedPath))
+			.currentPath(location.artifactPath())
+			.parentPath(getParentPath(location.artifactPath()))
 			.entries(entries)
 			.build();
 	}
@@ -142,112 +96,55 @@ public class BrowserService {
 	 * @return file information
 	 */
 	public FileInfo getFileInfo(String repositoryId, String path) throws IOException {
-		// Validate repository exists
-		if (!properties.repositories().containsKey(repositoryId)) {
-			throw new IllegalArgumentException("Repository not found: " + repositoryId);
-		}
-
-		// Normalize and validate path
-		String normalizedPath = normalizePath(path);
-		if (!StringUtils.hasText(normalizedPath)) {
+		ArtifactLocation location = toLocation(repositoryId, path);
+		if (location.isRoot()) {
 			throw new IllegalArgumentException("Path is required");
 		}
-
-		Path targetPath = basePath.resolve(repositoryId).resolve(normalizedPath).normalize();
-		Path repoRoot = basePath.resolve(repositoryId).normalize();
-
-		// Ensure path is within repository boundaries
-		if (!targetPath.startsWith(repoRoot)) {
-			throw new IllegalArgumentException("Invalid path: " + path);
-		}
-
-		// Check if file exists
-		if (!Files.exists(targetPath) || !Files.isRegularFile(targetPath)) {
-			throw new IllegalArgumentException("File not found: " + path);
-		}
-
-		// Get file information
-		String fileName = targetPath.getFileName().toString();
-		long size = Files.size(targetPath);
-		Instant lastModified = Files.getLastModifiedTime(targetPath).toInstant();
-		String contentType = determineContentType(fileName);
-
-		// Calculate checksums if they exist
-		Path sha1Path = targetPath.resolveSibling(fileName + ".sha1");
-		Path sha256Path = targetPath.resolveSibling(fileName + ".sha256");
-
-		String sha1 = null;
-		String sha256 = null;
-
-		if (Files.exists(sha1Path)) {
-			sha1 = Files.readString(sha1Path).trim();
-		}
-		if (Files.exists(sha256Path)) {
-			sha256 = Files.readString(sha256Path).trim();
-		}
-
+		StorageEntry entry = this.storageService.stat(location)
+			.filter(StorageEntry::isFile)
+			.orElseThrow(() -> new IllegalArgumentException("File not found: " + path));
+		String fileName = entry.name();
 		return FileInfo.builder()
 			.repositoryId(repositoryId)
-			.path(normalizedPath)
+			.path(entry.path())
 			.name(fileName)
 			.type("file")
-			.size(size)
-			.lastModified(lastModified)
-			.contentType(contentType)
-			.sha1(sha1)
-			.sha256(sha256)
+			.size(Objects.requireNonNullElse(entry.size(), 0L))
+			.lastModified(Objects.requireNonNull(entry.lastModified(), "lastModified is required for a file"))
+			.contentType(determineContentType(fileName))
+			.sha1(readChecksum(location.sibling(fileName + ".sha1")))
+			.sha256(readChecksum(location.sibling(fileName + ".sha256")))
 			.build();
 	}
 
-	private RepositoryEntry createRepositoryEntry(Path repoRoot, Path entryPath) throws IOException {
-		String relativePath = repoRoot.relativize(entryPath).toString().replace('\\', '/');
-		String name = entryPath.getFileName().toString();
-		String type = Files.isDirectory(entryPath) ? "directory" : "file";
-		Instant lastModified = Files.getLastModifiedTime(entryPath).toInstant();
-
-		RepositoryEntry.Builder builder = RepositoryEntry.builder()
-			.name(name)
-			.type(type)
-			.path(relativePath)
-			.lastModified(lastModified);
-		if ("file".equals(type)) {
-			builder.size(Files.size(entryPath));
+	private ArtifactLocation toLocation(String repositoryId, @Nullable String path) {
+		if (!this.properties.repositories().containsKey(repositoryId)) {
+			throw new IllegalArgumentException("Repository not found: " + repositoryId);
 		}
-		return builder.build();
+		return new ArtifactLocation(repositoryId, normalizePath(path));
 	}
 
-	private RepositoryStats calculateRepositoryStats(Path repoPath) throws IOException {
-		long artifactCount = 0;
-		long totalSize = 0;
-		Instant lastUpdated = Instant.MIN;
-
-		try (Stream<Path> stream = Files.walk(repoPath)) {
-			List<Path> files = stream.filter(Files::isRegularFile).toList();
-
-			for (Path file : files) {
-				// Count only main artifacts (skip checksums and metadata)
-				String fileName = file.getFileName().toString();
-				if (!fileName.endsWith(".sha1") && !fileName.endsWith(".sha256") && !fileName.endsWith(".md5")
-						&& !fileName.equals("maven-metadata.xml") && !fileName.equals("_remote.repositories")) {
-					artifactCount++;
-				}
-
-				totalSize += Files.size(file);
-				Instant modified = Files.getLastModifiedTime(file).toInstant();
-				if (modified.isAfter(lastUpdated)) {
-					lastUpdated = modified;
-				}
-			}
+	private @Nullable String readChecksum(ArtifactLocation location) throws IOException {
+		Optional<Resource> resource = this.storageService.retrieve(location);
+		if (resource.isEmpty()) {
+			return null;
 		}
+		try (InputStream inputStream = resource.get().getInputStream()) {
+			return StreamUtils.copyToString(inputStream, StandardCharsets.UTF_8).trim();
+		}
+	}
 
-		return RepositoryStats.builder()
-			.artifactCount(artifactCount)
-			.totalSize(totalSize)
-			.lastUpdated(lastUpdated.equals(Instant.MIN) ? null : lastUpdated)
+	private static RepositoryEntry toRepositoryEntry(StorageEntry entry) {
+		return RepositoryEntry.builder()
+			.name(entry.name())
+			.type(entry.isDirectory() ? "directory" : "file")
+			.path(entry.path())
+			.size(entry.size())
+			.lastModified(entry.lastModified())
 			.build();
 	}
 
-	private String normalizePath(@Nullable String path) {
+	private static String normalizePath(@Nullable String path) {
 		if (path == null || path.trim().isEmpty() || path.equals("/")) {
 			return "";
 		}
@@ -255,7 +152,7 @@ public class BrowserService {
 		return path.trim().replaceAll("^/+", "").replaceAll("/+$", "");
 	}
 
-	private @Nullable String getParentPath(String path) {
+	private static @Nullable String getParentPath(String path) {
 		if (!StringUtils.hasText(path)) {
 			return null;
 		}
@@ -266,7 +163,7 @@ public class BrowserService {
 		return path.substring(0, lastSlash);
 	}
 
-	private String determineContentType(String fileName) {
+	private static String determineContentType(String fileName) {
 		if (fileName.endsWith(".jar")) {
 			return "application/java-archive";
 		}
@@ -400,8 +297,13 @@ public class BrowserService {
 
 	}
 
+	/**
+	 * A file or directory entry. {@code lastModified} is absent for directories on
+	 * backends that do not track a directory timestamp (object storage).
+	 */
 	public record RepositoryEntry(String name, String type, String path,
-			@JsonInclude(JsonInclude.Include.NON_NULL) @Nullable Long size, Instant lastModified) {
+			@JsonInclude(JsonInclude.Include.NON_NULL) @Nullable Long size,
+			@JsonInclude(JsonInclude.Include.NON_NULL) @Nullable Instant lastModified) {
 
 		public static Builder builder() {
 			return new Builder();
@@ -442,7 +344,7 @@ public class BrowserService {
 				return this;
 			}
 
-			public Builder lastModified(Instant lastModified) {
+			public Builder lastModified(@Nullable Instant lastModified) {
 				this.lastModified = lastModified;
 				return this;
 			}
@@ -450,8 +352,7 @@ public class BrowserService {
 			public RepositoryEntry build() {
 				return new RepositoryEntry(Objects.requireNonNull(this.name, "name is required"),
 						Objects.requireNonNull(this.type, "type is required"),
-						Objects.requireNonNull(this.path, "path is required"), this.size,
-						Objects.requireNonNull(this.lastModified, "lastModified is required"));
+						Objects.requireNonNull(this.path, "path is required"), this.size, this.lastModified);
 			}
 
 		}
@@ -541,46 +442,6 @@ public class BrowserService {
 						Objects.requireNonNull(this.type, "type is required"), this.size,
 						Objects.requireNonNull(this.lastModified, "lastModified is required"),
 						Objects.requireNonNull(this.contentType, "contentType is required"), this.sha1, this.sha256);
-			}
-
-		}
-
-	}
-
-	private record RepositoryStats(long artifactCount, long totalSize, @Nullable Instant lastUpdated) {
-
-		static Builder builder() {
-			return new Builder();
-		}
-
-		static final class Builder {
-
-			private long artifactCount;
-
-			private long totalSize;
-
-			@Nullable private Instant lastUpdated;
-
-			private Builder() {
-			}
-
-			Builder artifactCount(long artifactCount) {
-				this.artifactCount = artifactCount;
-				return this;
-			}
-
-			Builder totalSize(long totalSize) {
-				this.totalSize = totalSize;
-				return this;
-			}
-
-			Builder lastUpdated(@Nullable Instant lastUpdated) {
-				this.lastUpdated = lastUpdated;
-				return this;
-			}
-
-			RepositoryStats build() {
-				return new RepositoryStats(this.artifactCount, this.totalSize, this.lastUpdated);
 			}
 
 		}

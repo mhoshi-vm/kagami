@@ -6,12 +6,13 @@ import am.ik.kagami.proxy.ProxySettings;
 import am.ik.kagami.storage.ArtifactLocation;
 import am.ik.kagami.storage.StorageService;
 import java.io.ByteArrayInputStream;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -41,7 +42,14 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 /**
- * Service for fetching artifacts from remote repositories using Maven Resolver
+ * Service for fetching artifacts from remote repositories using Maven Resolver.
+ * <p>
+ * Maven Resolver needs a local repository on disk. Instead of pointing it at Kagami's
+ * storage, every fetch resolves into a scratch directory that is discarded afterwards,
+ * and the resolved file is copied into {@link StorageService}. This keeps the storage
+ * backend the only place where mirrored artifacts live, and keeps the resolver's
+ * bookkeeping files ({@code _remote.repositories}, {@code maven-metadata-*.xml}) out of
+ * the served layout.
  */
 @Service
 public class RemoteRepositoryService {
@@ -54,8 +62,6 @@ public class RemoteRepositoryService {
 
 	private final Map<String, RemoteRepository> repositories;
 
-	private final Map<String, RepositorySystemSession> sessions;
-
 	private final RestClient restClient;
 
 	private final KagamiProperties kagamiProperties;
@@ -64,7 +70,6 @@ public class RemoteRepositoryService {
 			RestClient.Builder restClientBuilder, ProxySettings proxySettings) {
 		this.storageService = storageService;
 		this.repositories = new ConcurrentHashMap<>();
-		this.sessions = new ConcurrentHashMap<>();
 
 		// Store properties for later use in RestClient requests
 		this.kagamiProperties = properties;
@@ -97,11 +102,7 @@ public class RemoteRepositoryService {
 						logger.debug("Using proxy {} for repository {}", proxy, repoId);
 					});
 
-					RemoteRepository remoteRepo = repoBuilder.build();
-					this.repositories.put(repoId, remoteRepo);
-
-					// Create repository-specific session
-					this.sessions.put(repoId, createSession(repoId));
+					this.repositories.put(repoId, repoBuilder.build());
 				}
 			});
 		}
@@ -115,53 +116,54 @@ public class RemoteRepositoryService {
 	public boolean fetchArtifact(ArtifactLocation location) {
 		String artifactPath = location.artifactPath();
 		RemoteRepository repository = this.repositories.get(location.repositoryId());
-		RepositorySystemSession session = this.sessions.get(location.repositoryId());
-		if (repository == null || session == null) {
+		if (repository == null) {
 			return false;
 		}
 
+		// Parse artifact path to create artifact coordinates
+		Optional<ArtifactCoordinates> parsed = parseArtifactPath(artifactPath);
+		if (parsed.isEmpty()) {
+			// If it's not a standard artifact path, fall back to direct HTTP download
+			logger.debug("Path is not a standard artifact, using HTTP for: {}", artifactPath);
+			return fetchNonStandardFile(location, repository);
+		}
+
+		ArtifactCoordinates coords = parsed.get();
+		Artifact artifact = new DefaultArtifact(coords.groupId(), coords.artifactId(), coords.classifier(),
+				coords.extension(), coords.version());
+		ArtifactRequest artifactRequest = new ArtifactRequest();
+		artifactRequest.setArtifact(artifact);
+		artifactRequest.setRepositories(List.of(repository));
+
+		Path scratchDirectory;
 		try {
-			// Parse artifact path to create artifact coordinates
-			Optional<ArtifactCoordinates> parsed = parseArtifactPath(artifactPath);
-			if (parsed.isEmpty()) {
-				// If it's not a standard artifact path, fall back to direct HTTP download
-				logger.debug("Path is not a standard artifact, using HTTP for: {}", artifactPath);
-				boolean success = fetchNonStandardFile(location, repository);
-				if (!success) {
-					cleanupEmptyDirectories(location);
-				}
-				return success;
-			}
-
-			// Create artifact
-			ArtifactCoordinates coords = parsed.get();
-			Artifact artifact = new DefaultArtifact(coords.groupId(), coords.artifactId(), coords.classifier(),
-					coords.extension(), coords.version());
-
-			// Create artifact request
-			ArtifactRequest artifactRequest = new ArtifactRequest();
-			artifactRequest.setArtifact(artifact);
-			artifactRequest.setRepositories(List.of(repository));
-
-			// Resolve artifact
+			scratchDirectory = Files.createTempDirectory("kagami-resolver-");
+		}
+		catch (IOException e) {
+			logger.warn("Failed to create scratch directory for resolving {}", artifactPath, e);
+			return false;
+		}
+		try {
+			RepositorySystemSession session = createSession(scratchDirectory);
 			ArtifactResult result = this.repositorySystem.resolveArtifact(session, artifactRequest);
-
-			if (result.isResolved() && result.getArtifact() != null) {
-				File resolvedFile = result.getArtifact().getFile();
-				if (resolvedFile != null && resolvedFile.exists()) {
-					// Maven Resolver has already stored the artifact in
-					// repository-specific directory
-					return true;
-				}
+			Path resolvedFile = result.isResolved() && result.getArtifact() != null
+					&& result.getArtifact().getFile() != null ? result.getArtifact().getFile().toPath() : null;
+			if (resolvedFile == null || !Files.isRegularFile(resolvedFile)) {
+				return false;
 			}
+			try (InputStream inputStream = Files.newInputStream(resolvedFile)) {
+				this.storageService.store(location, inputStream);
+			}
+			return true;
 		}
 		catch (Exception e) {
 			// Log error but don't throw - return false to indicate failure
 			logger.debug("Failed to fetch artifact via Maven Resolver: {}", artifactPath, e);
-			cleanupEmptyDirectories(location);
+			return false;
 		}
-
-		return false;
+		finally {
+			deleteRecursively(scratchDirectory);
+		}
 	}
 
 	/**
@@ -211,23 +213,31 @@ public class RemoteRepositoryService {
 		return this.repositories.containsKey(repositoryId);
 	}
 
-	private RepositorySystemSession createSession(String repositoryId) {
+	/**
+	 * Create a resolver session whose local repository is the given scratch directory. A
+	 * fresh directory per fetch means no locking between concurrent requests.
+	 */
+	private RepositorySystemSession createSession(Path scratchDirectory) {
 		DefaultRepositorySystemSession session = MavenRepositorySystemUtils.newSession();
-
-		// Use repository-specific directory within Kagami's storage path
-		// This eliminates duplicate storage while keeping repositories separate
-		Path storagePath = Path.of(this.kagamiProperties.storage().path()).resolve(repositoryId);
-		try {
-			Files.createDirectories(storagePath);
-		}
-		catch (IOException e) {
-			throw new IllegalStateException("Failed to create storage directory: " + storagePath, e);
-		}
-
-		LocalRepository localRepo = new LocalRepository(storagePath.toFile());
+		LocalRepository localRepo = new LocalRepository(scratchDirectory.toFile());
 		session.setLocalRepositoryManager(this.repositorySystem.newLocalRepositoryManager(session, localRepo));
-
 		return session;
+	}
+
+	private static void deleteRecursively(Path directory) {
+		try (Stream<Path> walk = Files.walk(directory)) {
+			walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+				try {
+					Files.deleteIfExists(path);
+				}
+				catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+			});
+		}
+		catch (IOException | UncheckedIOException e) {
+			logger.debug("Failed to delete scratch directory {}", directory, e);
+		}
 	}
 
 	/**
@@ -311,38 +321,6 @@ public class RemoteRepositoryService {
 			.classifier(classifier)
 			.extension(extension)
 			.build());
-	}
-
-	/**
-	 * Clean up empty directories that may have been created during failed fetch attempts
-	 */
-	private void cleanupEmptyDirectories(ArtifactLocation location) {
-		String artifactPath = location.artifactPath();
-		try {
-			Path storagePath = Path.of(this.kagamiProperties.storage().path()).resolve(location.repositoryId());
-			Path artifactDir = storagePath.resolve(artifactPath).getParent();
-
-			// Walk up the directory tree and remove empty directories
-			while (artifactDir != null && artifactDir.startsWith(storagePath) && !artifactDir.equals(storagePath)) {
-				if (Files.exists(artifactDir) && Files.isDirectory(artifactDir)) {
-					try (Stream<Path> stream = Files.list(artifactDir)) {
-						if (stream.findFirst().isEmpty()) {
-							// Directory is empty, remove it
-							Files.delete(artifactDir);
-							logger.debug("Removed empty directory: {}", artifactDir);
-						}
-						else {
-							// Directory is not empty, stop cleanup
-							break;
-						}
-					}
-				}
-				artifactDir = artifactDir.getParent();
-			}
-		}
-		catch (Exception e) {
-			logger.debug("Failed to cleanup empty directories for {}: {}", artifactPath, e.getMessage());
-		}
 	}
 
 	private record ArtifactCoordinates(String groupId, String artifactId, String version, String classifier,

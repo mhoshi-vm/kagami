@@ -125,7 +125,7 @@ export function DirectoryBrowser({
                 {entry.type === 'file' && entry.size !== undefined ? formatFileSize(entry.size) : ''}
               </span>
               <span className="hidden md:inline text-[11.5px] text-ink-2 text-right min-w-[110px]">
-                {formatRelativeTime(entry.lastModified)}
+                {entry.lastModified ? formatRelativeTime(entry.lastModified) : ''}
               </span>
               <div className="flex gap-1.5 opacity-25 group-hover:opacity-100 transition-opacity">
                 {entry.type === 'file' && (

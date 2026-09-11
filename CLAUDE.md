@@ -31,14 +31,16 @@ cd ui && npm run dev                                            # Start developm
 ### Core Components
 
 1. **Storage Layer** (`am.ik.kagami.storage`)
-   - `StorageService` interface with minimal methods: `store()`, `retrieve()`, `delete()`
-   - `LocalStorageService` implementation using filesystem
-   - Designed for future S3 storage implementation
-   - Maven Resolver stores artifacts directly in `kagami.storage.path/{repositoryId}/`
+   - `StorageService` interface: `store()`, `retrieve()`, `delete()`, `list()`, `stat()`, `stats()`
+   - `ArtifactLocation` validates paths (rejects `..`, `~`, absolute paths); an empty path is the repository root
+   - `StorageEntry` / `StorageStats` records describe listed objects and repository statistics
+   - `LocalStorageService` implementation using filesystem, stored at `kagami.storage.path/{repositoryId}/`
+   - The only path to stored artifacts; no other package touches the filesystem
+   - `StorageServiceContractTest` is the abstract contract every backend test must extend
 
 2. **Repository Management** (`am.ik.kagami.repository`)
    - `RemoteRepositoryService` uses Maven Resolver API for standard artifacts
-   - Separate `RepositorySystemSession` per repository ID to maintain isolation
+   - Each fetch resolves into a scratch local repository (temp directory) and streams the result into `StorageService`
    - Falls back to `RestClient` for non-standard files (e.g., maven-metadata.xml)
    - Supports Basic authentication and HTTP proxy configuration
 
@@ -52,8 +54,9 @@ cd ui && npm run dev                                            # Start developm
    - Returns proper content types based on file extensions
 
 4. **Browser Feature** (`am.ik.kagami.browser`)
-   - `BrowserService` provides repository exploration and statistics
+   - `BrowserService` provides repository exploration and statistics on top of `StorageService`
    - Repository listing with artifact count, size, and last update timestamps
+   - `lastModified` of a directory entry is optional (object storage has no directory timestamp)
    - Directory navigation with breadcrumb support
    - File information with checksums and content types
    - Uses `@JsonInclude(NON_NULL)` to exclude null values from JSON responses
@@ -140,7 +143,9 @@ Current package structure:
     - `repository` - Remote repository management
         - `RemoteRepositoryService` - Maven Resolver integration
     - `storage` - Storage abstraction layer
-        - `StorageService` - Minimal interface (store/retrieve/delete)
+        - `StorageService` - Interface (store/retrieve/delete/list/stat/stats)
+        - `ArtifactLocation` - Validated repository id + relative path
+        - `StorageEntry`, `StorageStats` - Listing and statistics records
         - `LocalStorageService` - Filesystem implementation
     - `config` - Configuration classes (e.g., security, cross-cutting concerns)
         - `SecurityConfig` - Spring Security configuration with form login
@@ -176,6 +181,8 @@ domain objects should be clean and not contain external layers like web or datab
 Backend:
 - **Unit Tests**: JUnit 5 with AssertJ for service layer testing
 - **Integration Tests**: `@SpringBootTest` + Testcontainers for full application context
+- **Contract Tests**: `StorageServiceContractTest` is run against every `StorageService` backend
+- **E2E Tests**: `BrowserE2ETestBase` drives the built UI with Playwright (Chromium); each backend has a subclass
 - **Test Data Management**: Use `@TempDir` for filesystem testing, maintain test independence
 - **Test Stability**: All tests must pass consistently; use specific MockMvc expectations
 - All tests must pass before completing tasks
@@ -200,14 +207,14 @@ osascript -e 'display notification "<Message Body>" with title "<Message Title>"
 ## Important Architecture Decisions
 
 1. **Maven Resolver Integration**
-   - Each repository has its own `RepositorySystemSession` to maintain isolation
-   - Maven Resolver's local repository is set to `kagami.storage.path/{repositoryId}/`
-   - This eliminates duplicate storage between Maven Resolver and Kagami
+   - Maven Resolver resolves into a scratch local repository (temp directory) per fetch, removed afterwards
+   - The resolved file is copied into `StorageService`; resolver bookkeeping files never reach the storage
+   - A scratch directory per fetch means no shared local-repository locking between requests
    - Non-standard files (like maven-metadata.xml) are fetched via RestClient
 
 2. **Storage Abstraction**
-   - Minimal interface design for easy S3 migration
-   - No path-specific return values that would be meaningless for cloud storage
+   - `StorageService` is the single path to stored artifacts, so a new backend touches no other package
+   - No `Path` / `File` in the interface; `delete` removes everything at or under a location
    - Resource-based retrieval allows flexible implementation
 
 3. **Configuration Design**

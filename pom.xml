@@ -239,6 +239,32 @@
         </configuration>
       </plugin>
       <plugin>
+        <!-- Install the Chromium build required by the Playwright E2E tests. Only Chromium is
+             installed; the tests skip the default download of Firefox and WebKit. -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>install playwright chromium</id>
+            <phase>process-test-classes</phase>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <executable>${java.home}/bin/java</executable>
+              <classpathScope>test</classpathScope>
+              <arguments>
+                <argument>-cp</argument>
+                <classpath/>
+                <argument>com.microsoft.playwright.CLI</argument>
+                <argument>install</argument>
+                <argument>chromium</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
         <groupId>com.github.eirslett</groupId>
         <artifactId>frontend-maven-plugin</artifactId>
         <version>2.0.2</version>
@@ -289,5 +315,41 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <!-- CI runners also need the system libraries Chromium depends on -->
+      <id>ci</id>
+      <activation>
+        <property>
+          <name>env.CI</name>
+          <value>true</value>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>install playwright chromium</id>
+                <configuration>
+                  <arguments>
+                    <argument>-cp</argument>
+                    <classpath/>
+                    <argument>com.microsoft.playwright.CLI</argument>
+                    <argument>install</argument>
+                    <argument>--with-deps</argument>
+                    <argument>chromium</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 
 </project>

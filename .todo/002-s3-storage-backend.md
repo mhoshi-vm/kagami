@@ -2,9 +2,9 @@
 
 Difficulty: Medium
 
-Depends on [001-decouple-storage-from-filesystem.md](001-decouple-storage-from-filesystem.md).
-Start only once `StorageService` is the single path to stored artifacts and the storage
-contract test exists; this item is then a new implementation of a settled contract.
+Depends on 001 (decouple the storage layer from the local filesystem), which is done:
+`StorageService` is the single path to stored artifacts, `StorageServiceContractTest`
+and `BrowserE2ETestBase` exist. This item is a new implementation of a settled contract.
 
 ## Goal
 

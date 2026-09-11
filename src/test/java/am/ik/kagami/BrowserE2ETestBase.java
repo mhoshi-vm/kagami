@@ -136,11 +136,14 @@ public abstract class BrowserE2ETestBase {
 		Locator fileRow = this.page.locator("div.group", new Page.LocatorOptions()
 			.setHas(this.page.getByText("kagami-0.0.1.pom", new Page.GetByTextOptions().setExact(true))));
 		fileRow.getByRole(AriaRole.BUTTON, new Locator.GetByRoleOptions().setName("Info")).click();
-		assertThat(this.page.getByText("File Information / kagami-0.0.1.pom")).isVisible();
-		assertThat(this.page.getByText(POM_CONTENT.length() + " B")).isVisible();
-		assertThat(this.page.getByText(sha1)).isVisible();
-		this.page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Close")).click();
-		assertThat(this.page.getByText("File Information / kagami-0.0.1.pom")).not().isVisible();
+		// Scope the assertions to the modal; the listing behind it shows the same size
+		Locator modal = this.page.locator("div.fixed",
+				new Page.LocatorOptions().setHasText("File Information / kagami-0.0.1.pom"));
+		assertThat(modal).isVisible();
+		assertThat(modal.getByText(POM_CONTENT.length() + " B")).isVisible();
+		assertThat(modal.getByText(sha1)).isVisible();
+		modal.getByRole(AriaRole.BUTTON, new Locator.GetByRoleOptions().setName("Close")).click();
+		assertThat(modal).not().isVisible();
 
 		// Generate a token for the mock repository
 		this.page.navigate(baseUrl + "/token");
